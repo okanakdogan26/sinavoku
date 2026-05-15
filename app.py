@@ -42,6 +42,10 @@ def _serialize_standard_keys(keys):
 
 txt_file = st.file_uploader("Öğrenci dosyası (.txt)", type=["txt"])
 pdf_file = st.file_uploader("Cevap anahtarı (.pdf)", type=["pdf"])
+kazanim_file = st.file_uploader(
+    "Kazanım tablosu (.csv / .xlsx) - Opsiyonel",
+    type=["csv", "xlsx"],
+)
 
 if st.button("Sonuç Oluştur", type="primary", use_container_width=True):
     if txt_file is None or pdf_file is None:
@@ -54,9 +58,13 @@ if st.button("Sonuç Oluştur", type="primary", use_container_width=True):
                 pdf_path = tmp / pdf_file.name
                 key_json_path = tmp / "answer_key.standard.json"
                 out_path = tmp / "sinav_sonuclari.xlsx"
+                kazanim_path = None
 
                 txt_path.write_bytes(txt_file.getvalue())
                 pdf_path.write_bytes(pdf_file.getvalue())
+                if kazanim_file is not None:
+                    kazanim_path = tmp / kazanim_file.name
+                    kazanim_path.write_bytes(kazanim_file.getvalue())
 
                 try:
                     # Auto-generate draft standard key JSON from uploaded PDF.
@@ -64,7 +72,12 @@ if st.button("Sonuç Oluştur", type="primary", use_container_width=True):
                     key_json_path.write_bytes(_serialize_standard_keys(standard_keys))
 
                     # Run scoring with standardized key, not raw PDF.
-                    df = run_pipeline(str(txt_path), str(key_json_path), str(out_path))
+                    df = run_pipeline(
+                        str(txt_path),
+                        str(key_json_path),
+                        str(out_path),
+                        str(kazanim_path) if kazanim_path else None,
+                    )
                 except ValueError as exc:
                     st.error(str(exc))
                 except Exception as exc:
@@ -89,6 +102,10 @@ if st.button("Sonuç Oluştur", type="primary", use_container_width=True):
                         mime="application/json",
                         use_container_width=True,
                     )
+                    if "kazanim_weak_preview" in df.attrs:
+                        st.markdown("### Kazanım Analizi (Zayıf Alanlar)")
+                        st.caption("Detaylar indirilen Excel içinde: Kazanım Zayıf / Kazanım Özet / Kazanım Detay.")
+                        st.dataframe(pd.DataFrame(df.attrs["kazanim_weak_preview"]), use_container_width=True)
 
                     st.markdown("### Detaylı Analiz")
 

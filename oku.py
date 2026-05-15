@@ -18,6 +18,49 @@ TESTS = [
 ]
 DEFAULT_TEST_LENGTHS = dict(TESTS)
 
+# TYT puanı için kurum çıktısına kalibre edilmiş katsayılar.
+# (11.SINIF SÜREÇ ANALİZİ 1 gerçek sonuç tablosundan türetilmiştir.)
+TYT_BASE_SCORE = 144.9496405
+TYT_COEFFICIENTS = {
+    "Türkçe": 2.88790178,
+    "Sosyal": 2.91602531,
+    "Matematik": 2.90504068,
+    "Fen": 3.12600659,
+}
+
+SOZ_BASE_SCORE = 111.356738
+SOZ_COEFFICIENTS = {
+    "Türkçe": 6.48254985,
+    "Sosyal": 6.62280338,
+    "Matematik": -0.183190932,
+    "Fen": -0.00771334513,
+}
+
+SAY_BASE_SCORE = 109.61517569
+SAY_COEFFICIENTS = {
+    "Türkçe": -0.41844955,
+    "Sosyal": 0.31249024,
+    "Matematik": 6.6088891,
+    "Fen": 6.29762888,
+}
+
+EA_BASE_SCORE = 114.711013
+EA_COEFFICIENTS = {
+    "Türkçe": 6.82709757,
+    "Sosyal": -0.00002789615,
+    "Matematik": 6.0159298,
+    "Fen": 0.00003545567,
+}
+
+# AYT-benzeri oturumlar için yaklaşık kurum puanı.
+AYT_BASE_SCORE = 100.0
+AYT_COEFFICIENTS = {
+    "Türkçe": 2.0,
+    "Sosyal": 2.0,
+    "Matematik": 2.0,
+    "Fen": 2.0,
+}
+
 
 def normalize_answers(s):
     return "".join(ch if ch in "ABCDE" else " " for ch in s)
@@ -291,6 +334,20 @@ def get_test_lengths(keys):
         )
         for test_name, _ in TESTS
     }
+
+
+def detect_exam_profile(lengths):
+    signature = (
+        lengths["Türkçe"],
+        lengths["Sosyal"],
+        lengths["Matematik"],
+        lengths["Fen"],
+    )
+    if signature == (30, 30, 30, 30):
+        return "school_30x4"
+    if signature == (40, 20, 40, 20):
+        return "tyt"
+    return "ayt_like"
 
 
 def answers_from_layout(line, s1, s2, o1, o2, lengths):
@@ -572,7 +629,244 @@ def d_y_n(ans, key):
     return d, y, n
 
 
-def run_pipeline(txt_path, pdf_path, output_xlsx):
+def compute_tyt_score(row):
+    score = TYT_BASE_SCORE
+    score += row["Türkçe Net"] * TYT_COEFFICIENTS["Türkçe"]
+    score += row["Sosyal Net"] * TYT_COEFFICIENTS["Sosyal"]
+    score += row["Matematik Net"] * TYT_COEFFICIENTS["Matematik"]
+    score += row["Fen Net"] * TYT_COEFFICIENTS["Fen"]
+    return round(score, 3)
+
+
+def compute_weighted_score(row, base, coefs):
+    score = base
+    score += row["Türkçe Net"] * coefs["Türkçe"]
+    score += row["Sosyal Net"] * coefs["Sosyal"]
+    score += row["Matematik Net"] * coefs["Matematik"]
+    score += row["Fen Net"] * coefs["Fen"]
+    return round(score, 3)
+
+
+def compute_soz_score(row):
+    return compute_weighted_score(row, SOZ_BASE_SCORE, SOZ_COEFFICIENTS)
+
+
+def compute_say_score(row):
+    return compute_weighted_score(row, SAY_BASE_SCORE, SAY_COEFFICIENTS)
+
+
+def compute_ea_score(row):
+    return compute_weighted_score(row, EA_BASE_SCORE, EA_COEFFICIENTS)
+
+
+def compute_ayt_score(row):
+    return compute_weighted_score(row, AYT_BASE_SCORE, AYT_COEFFICIENTS)
+
+
+def normalize_external_test_name(name):
+    s = unicodedata.normalize("NFKD", str(name or ""))
+    s = "".join(ch for ch in s if not unicodedata.combining(ch)).upper()
+    if "EDEBIYAT-SOSYAL-1" in s or "EDEBIYAT SOSYAL-1" in s or "EDEBIYAT SOSYAL 1" in s:
+        return "Türkçe"
+    if "SOSYAL-2" in s or "SOSYAL 2" in s:
+        return "Sosyal"
+    if "SOSYAL" in s:
+        return "Sosyal"
+    if "MATEMATIK" in s:
+        return "Matematik"
+    if "FEN" in s:
+        return "Fen"
+    return None
+
+
+def load_kazanim_table(path):
+    def canonical(s):
+        n = unicodedata.normalize("NFKD", str(s or ""))
+        n = "".join(ch for ch in n if not unicodedata.combining(ch))
+        n = n.lower().strip()
+        n = n.replace("ı", "i")
+        n = re.sub(r"\s+", " ", n)
+        return n
+
+    col_aliases = {
+        "kitapcik": "Kitapçık",
+        "test": "Test",
+        "ders": "Ders",
+        "a soru": "A Soru",
+        "b soru": "B Soru",
+        "cevap": "Cevap",
+        "kazanim kodu": "Kazanım Kodu",
+        "kazanım kodu": "Kazanım Kodu",
+    }
+    required = {"Kitapçık", "Test", "Ders", "A Soru", "B Soru", "Cevap", "Kazanım Kodu"}
+
+    def standardize_columns(df):
+        renamed = {}
+        for c in df.columns:
+            k = canonical(c)
+            if k in col_aliases:
+                renamed[c] = col_aliases[k]
+        if renamed:
+            df = df.rename(columns=renamed)
+        df.columns = [str(c).strip() for c in df.columns]
+        return df
+
+    def has_required(df):
+        cols = set(df.columns)
+        return required.issubset(cols)
+
+    def read_candidates(p):
+        is_csv = p.endswith(".csv")
+        if is_csv:
+            readers = [
+                lambda: pd.read_csv(path, sep=";", encoding="utf-8-sig", header=2),
+                lambda: pd.read_csv(path, sep=";", encoding="utf-8-sig", header=0),
+            ]
+        else:
+            readers = [
+                lambda: pd.read_excel(path, header=2),
+                lambda: pd.read_excel(path, header=0),
+            ]
+        for rd in readers:
+            try:
+                df = standardize_columns(rd())
+                if has_required(df):
+                    return df
+            except Exception:
+                pass
+        return None
+
+    p = str(path).lower()
+    table = read_candidates(p)
+    if table is None:
+        # Last resort: detect header row from raw sheet by scanning first 20 rows.
+        raw = pd.read_csv(path, sep=";", encoding="utf-8-sig", header=None) if p.endswith(".csv") else pd.read_excel(path, header=None)
+        header_idx = None
+        for i in range(min(20, len(raw))):
+            vals = [canonical(v) for v in raw.iloc[i].tolist()]
+            if {"kitapcik", "test", "ders", "a soru", "b soru", "cevap", "kazanim kodu"}.issubset(set(vals)):
+                header_idx = i
+                break
+        if header_idx is None:
+            raise ValueError("Kazanım tablosu başlık satırı okunamadı.")
+        cols = [str(x).strip() for x in raw.iloc[header_idx].tolist()]
+        table = raw.iloc[header_idx + 1 :].copy()
+        table.columns = cols
+        table = standardize_columns(table)
+        if not has_required(table):
+            missing = required.difference(set(table.columns))
+            raise ValueError(f"Kazanım tablosunda eksik kolonlar var: {', '.join(sorted(missing))}")
+
+    for col in ["A Soru", "B Soru"]:
+        table[col] = pd.to_numeric(table[col], errors="coerce")
+
+    kazanım_cols = [c for c in table.columns if c.startswith("Kazanım-")]
+    for c in kazanım_cols:
+        table[c] = table[c].fillna("").astype(str).str.strip()
+
+    def build_kazanim_text(row):
+        parts = [row.get("Kazanım Kodu", "")]
+        parts.extend(row.get(c, "") for c in kazanım_cols)
+        parts = [str(x).strip() for x in parts if str(x).strip() and str(x).strip().lower() != "nan"]
+        return " | ".join(parts)
+
+    table["__test_key"] = table["Test"].map(normalize_external_test_name)
+    table["__kazanım_text"] = table.apply(build_kazanim_text, axis=1)
+    table = table[table["__test_key"].notna()].copy()
+    return table
+
+
+def build_kazanim_analysis(df, keys, kazanim_table):
+    rows = []
+    for _, stu in df.iterrows():
+        booklet = str(stu.get("Tahmini Kitapçık", "")).strip().upper()
+        if booklet not in {"A", "B"}:
+            continue
+
+        q_col = "A Soru" if booklet == "A" else "B Soru"
+        for _, kz in kazanim_table.iterrows():
+            q = kz.get(q_col)
+            if pd.isna(q):
+                continue
+            q = int(q)
+            test_name = kz["__test_key"]
+            ans_col = f"Ans {test_name}"
+            if ans_col not in stu:
+                continue
+            ans = str(stu.get(ans_col, ""))
+            key = str(keys.get(booklet, {}).get(test_name, ""))
+            if q < 1 or q > len(ans) or q > len(key):
+                continue
+            if key[q - 1] == " ":
+                continue
+
+            student_mark = ans[q - 1]
+            key_mark = key[q - 1]
+            if student_mark == " ":
+                durum = "Boş"
+            elif student_mark == key_mark:
+                durum = "Doğru"
+            else:
+                durum = "Yanlış"
+
+            rows.append(
+                {
+                    "Ad Soyad": stu.get("Ad Soyad", ""),
+                    "Sınıf": stu.get("Sınıf", ""),
+                    "Kitapçık": booklet,
+                    "Test": kz.get("Test", ""),
+                    "Ders": kz.get("Ders", ""),
+                    "Soru No": q,
+                    "Doğru Cevap": key_mark,
+                    "Öğrenci Cevap": student_mark,
+                    "Durum": durum,
+                    "Kazanım Kodu": kz.get("Kazanım Kodu", ""),
+                    "Kazanım": kz.get("__kazanım_text", ""),
+                }
+            )
+
+    detail = pd.DataFrame(rows)
+    if detail.empty:
+        return detail, detail, detail
+
+    per_student = (
+        detail.groupby(["Ad Soyad", "Sınıf", "Test", "Ders", "Kazanım Kodu", "Kazanım", "Durum"])
+        .size()
+        .unstack(fill_value=0)
+        .reset_index()
+    )
+    for c in ["Doğru", "Yanlış", "Boş"]:
+        if c not in per_student.columns:
+            per_student[c] = 0
+    per_student["Soru Sayısı"] = per_student["Doğru"] + per_student["Yanlış"] + per_student["Boş"]
+    per_student["Başarı %"] = (
+        (per_student["Doğru"] / per_student["Soru Sayısı"]).replace([float("inf")], 0).fillna(0) * 100.0
+    ).round(1)
+    weak = per_student[(per_student["Yanlış"] + per_student["Boş"] > 0)].sort_values(
+        ["Başarı %", "Yanlış", "Boş"], ascending=[True, False, False]
+    )
+
+    class_summary = (
+        detail.groupby(["Test", "Ders", "Kazanım Kodu", "Kazanım", "Durum"])
+        .size()
+        .unstack(fill_value=0)
+        .reset_index()
+    )
+    for c in ["Doğru", "Yanlış", "Boş"]:
+        if c not in class_summary.columns:
+            class_summary[c] = 0
+    class_summary["Soru Sayısı"] = (
+        class_summary["Doğru"] + class_summary["Yanlış"] + class_summary["Boş"]
+    )
+    class_summary["Başarı %"] = (
+        (class_summary["Doğru"] / class_summary["Soru Sayısı"]).replace([float("inf")], 0).fillna(0) * 100.0
+    ).round(1)
+    class_summary = class_summary.sort_values(["Başarı %", "Yanlış", "Boş"], ascending=[True, False, False])
+
+    return detail, weak, class_summary
+
+
+def run_pipeline(txt_path, pdf_path, output_xlsx, kazanim_path=None):
     print("Cevap anahtarı okunuyor...")
     if str(pdf_path).lower().endswith(".json"):
         keys = load_standard_key_json(pdf_path)
@@ -657,6 +951,36 @@ def run_pipeline(txt_path, pdf_path, output_xlsx):
 
     df = df.sort_values("Toplam Net", ascending=False).reset_index(drop=True)
     df.insert(0, "Sıra", range(1, len(df) + 1))
+    df["TYT Puan"] = df.apply(compute_tyt_score, axis=1)
+    df["AYT Puan"] = df.apply(compute_ayt_score, axis=1)
+    df["SÖZ Puan"] = df.apply(compute_soz_score, axis=1)
+    df["SAY Puan"] = df.apply(compute_say_score, axis=1)
+    df["EA Puan"] = df.apply(compute_ea_score, axis=1)
+    df["TYT Sıra"] = (
+        df["TYT Puan"]
+        .rank(method="min", ascending=False)
+        .astype(int)
+    )
+    df["SÖZ Sıra"] = (
+        df["SÖZ Puan"]
+        .rank(method="min", ascending=False)
+        .astype(int)
+    )
+    df["SAY Sıra"] = (
+        df["SAY Puan"]
+        .rank(method="min", ascending=False)
+        .astype(int)
+    )
+    df["EA Sıra"] = (
+        df["EA Puan"]
+        .rank(method="min", ascending=False)
+        .astype(int)
+    )
+    df["AYT Sıra"] = (
+        df["AYT Puan"]
+        .rank(method="min", ascending=False)
+        .astype(int)
+    )
 
     stats_rows = []
     for sinif, group in df.groupby("Sınıf"):
@@ -684,53 +1008,75 @@ def run_pipeline(txt_path, pdf_path, output_xlsx):
     )
     df_stats = pd.DataFrame(stats_rows)
 
-    # Reference-like format sheets (TYT / NET SIRALI)
-    is_tyt_profile = (
-        lengths["Türkçe"] == 40
-        and lengths["Sosyal"] == 20
-        and lengths["Matematik"] == 40
-        and lengths["Fen"] == 20
-    )
-    has_tyt_subbreakdown = is_tyt_profile
-    tyt_rows = []
-    for _, r in df.iterrows():
-        bk = r["Tahmini Kitapçık"]
-        key = keys[bk]
+    exam_profile = detect_exam_profile(lengths)
+    print(f"Sınav profili: {exam_profile}")
 
-        sos = r["Ans Sosyal"]
-        fen = r["Ans Fen"]
-        if has_tyt_subbreakdown:
+    report_rows = []
+    if exam_profile == "school_30x4":
+        for _, r in df.iterrows():
+            toplam_d = r["Türkçe Doğru"] + r["Sosyal Doğru"] + r["Matematik Doğru"] + r["Fen Doğru"]
+            toplam_y = r["Türkçe Yanlış"] + r["Sosyal Yanlış"] + r["Matematik Yanlış"] + r["Fen Yanlış"]
+            report_rows.append(
+                {
+                    "Sıra": int(r["Sıra"]),
+                    "Numara": 0,
+                    "İsim": r["Ad Soyad"],
+                    "Sınıf": r["Sınıf"] if pd.notna(r["Sınıf"]) else "",
+                    "TYT Türkçe D": r["Türkçe Doğru"],
+                    "TYT Türkçe Y": r["Türkçe Yanlış"],
+                    "TYT Türkçe N": r["Türkçe Net"],
+                    "TYT Sosyal D": r["Sosyal Doğru"],
+                    "TYT Sosyal Y": r["Sosyal Yanlış"],
+                    "TYT Sosyal N": r["Sosyal Net"],
+                    "TYT Matematik D": r["Matematik Doğru"],
+                    "TYT Matematik Y": r["Matematik Yanlış"],
+                    "TYT Matematik N": r["Matematik Net"],
+                    "TYT Fen D": r["Fen Doğru"],
+                    "TYT Fen Y": r["Fen Yanlış"],
+                    "TYT Fen N": r["Fen Net"],
+                    "Toplam D": toplam_d,
+                    "Toplam Y": toplam_y,
+                    "NET": r["Toplam Net"],
+                    "TYT Puan": r["TYT Puan"],
+                    "TYT Sıra": int(r["TYT Sıra"]),
+                    "TYT Okul": int(r["TYT Sıra"]),
+                    "TYT Genel": int(r["TYT Sıra"]),
+                    "SÖZ Puan": r["SÖZ Puan"],
+                    "SÖZ Sıra": int(r["SÖZ Sıra"]),
+                    "SÖZ Okul": int(r["SÖZ Sıra"]),
+                    "SÖZ Genel": int(r["SÖZ Sıra"]),
+                    "SAY Puan": r["SAY Puan"],
+                    "SAY Sıra": int(r["SAY Sıra"]),
+                    "SAY Okul": int(r["SAY Sıra"]),
+                    "SAY Genel": int(r["SAY Sıra"]),
+                    "EA Puan": r["EA Puan"],
+                    "EA Sıra": int(r["EA Sıra"]),
+                    "EA Okul": int(r["EA Sıra"]),
+                    "EA Genel": int(r["EA Sıra"]),
+                }
+            )
+    elif exam_profile == "tyt":
+        for _, r in df.iterrows():
+            bk = r["Tahmini Kitapçık"]
+            key = keys[bk]
+            sos = r["Ans Sosyal"]
+            fen = r["Ans Fen"]
             tar_d, tar_y, tar_n = d_y_n(sos[0:5], key["Sosyal"][0:5])
             cog_d, cog_y, cog_n = d_y_n(sos[5:10], key["Sosyal"][5:10])
             fel_d, fel_y, fel_n = d_y_n(sos[10:15], key["Sosyal"][10:15])
             din_d, din_y, din_n = d_y_n(sos[15:20], key["Sosyal"][15:20])
-
             fiz_d, fiz_y, fiz_n = d_y_n(fen[0:7], key["Fen"][0:7])
             kim_d, kim_y, kim_n = d_y_n(fen[7:14], key["Fen"][7:14])
             bio_d, bio_y, bio_n = d_y_n(fen[14:20], key["Fen"][14:20])
-        else:
-            tar_d = tar_y = tar_n = ""
-            cog_d = cog_y = cog_n = ""
-            fel_d = fel_y = fel_n = ""
-            din_d = din_y = din_n = ""
-            fiz_d = fiz_y = fiz_n = ""
-            kim_d = kim_y = kim_n = ""
-            bio_d = bio_y = bio_n = ""
-
-        toplam_d = r["Türkçe Doğru"] + r["Sosyal Doğru"] + r["Matematik Doğru"] + r["Fen Doğru"]
-        toplam_y = r["Türkçe Yanlış"] + r["Sosyal Yanlış"] + r["Matematik Yanlış"] + r["Fen Yanlış"]
-
-        if is_tyt_profile:
-            tyt_rows.append(
+            toplam_d = r["Türkçe Doğru"] + r["Sosyal Doğru"] + r["Matematik Doğru"] + r["Fen Doğru"]
+            toplam_y = r["Türkçe Yanlış"] + r["Sosyal Yanlış"] + r["Matematik Yanlış"] + r["Fen Yanlış"]
+            report_rows.append(
                 {
-                    "NO": int(r["Sıra"]),
-                    "ŞUBE": r["Sınıf"] if pd.notna(r["Sınıf"]) else "",
+                    "Sıra": int(r["Sıra"]),
                     "Numara": 0,
-                    "AD VE SOYAD": r["Ad Soyad"],
-                    "ALAN": "",
-                    "Türkçe D": r["Türkçe Doğru"],
-                    "Türkçe Y": r["Türkçe Yanlış"],
-                    "Türkçe N": r["Türkçe Net"],
+                    "İsim": r["Ad Soyad"],
+                    "Sınıf": r["Sınıf"] if pd.notna(r["Sınıf"]) else "",
+                    "Türkçe D": r["Türkçe Doğru"], "Türkçe Y": r["Türkçe Yanlış"], "Türkçe N": r["Türkçe Net"],
                     "Tarih D": tar_d, "Tarih Y": tar_y, "Tarih N": tar_n,
                     "Coğrafya D": cog_d, "Coğrafya Y": cog_y, "Coğrafya N": cog_n,
                     "Felsefe D": fel_d, "Felsefe Y": fel_y, "Felsefe N": fel_n,
@@ -739,142 +1085,125 @@ def run_pipeline(txt_path, pdf_path, output_xlsx):
                     "Fizik D": fiz_d, "Fizik Y": fiz_y, "Fizik N": fiz_n,
                     "Kimya D": kim_d, "Kimya Y": kim_y, "Kimya N": kim_n,
                     "Biyoloji D": bio_d, "Biyoloji Y": bio_y, "Biyoloji N": bio_n,
-                    "Toplam D": toplam_d,
-                    "Toplam Y": toplam_y,
-                    "NET": r["Toplam Net"],
-                    "TYT PUANI": "",
-                    "GENEL": "",
-                    "KURUM": int(r["Sıra"]),
-                    "ŞUBE SIRA": "",
-                    "SINIF SIRA": "",
-                    "OSYM23": "",
-                    "OSYM24": "",
-                    "OSYM25": "",
+                    "Toplam D": toplam_d, "Toplam Y": toplam_y, "NET": r["Toplam Net"],
+                    "TYT Puan": r["TYT Puan"],
+                    "TYT Sıra": int(r["TYT Sıra"]),
+                    "TYT Okul": int(r["TYT Sıra"]),
+                    "TYT Genel": int(r["TYT Sıra"]),
                 }
             )
-        else:
-            tyt_rows.append(
+    else:
+        for _, r in df.iterrows():
+            toplam_d = r["Türkçe Doğru"] + r["Sosyal Doğru"] + r["Matematik Doğru"] + r["Fen Doğru"]
+            toplam_y = r["Türkçe Yanlış"] + r["Sosyal Yanlış"] + r["Matematik Yanlış"] + r["Fen Yanlış"]
+            report_rows.append(
                 {
-                    "NO": int(r["Sıra"]),
-                    "ŞUBE": r["Sınıf"] if pd.notna(r["Sınıf"]) else "",
+                    "Sıra": int(r["Sıra"]),
                     "Numara": 0,
-                    "AD VE SOYAD": r["Ad Soyad"],
-                    "ALAN": "",
-                    "Türk Dili ve Edebiyatı D": r["Türkçe Doğru"],
-                    "Türk Dili ve Edebiyatı Y": r["Türkçe Yanlış"],
-                    "Türk Dili ve Edebiyatı N": r["Türkçe Net"],
-                    "Sosyal Bilimler D": r["Sosyal Doğru"],
-                    "Sosyal Bilimler Y": r["Sosyal Yanlış"],
-                    "Sosyal Bilimler N": r["Sosyal Net"],
-                    "Matematik D": r["Matematik Doğru"],
-                    "Matematik Y": r["Matematik Yanlış"],
-                    "Matematik N": r["Matematik Net"],
-                    "Fen Bilimleri D": r["Fen Doğru"],
-                    "Fen Bilimleri Y": r["Fen Yanlış"],
-                    "Fen Bilimleri N": r["Fen Net"],
-                    "Toplam D": toplam_d,
-                    "Toplam Y": toplam_y,
-                    "NET": r["Toplam Net"],
-                    "PUAN": "",
-                    "GENEL": "",
-                    "KURUM": int(r["Sıra"]),
-                    "ŞUBE SIRA": "",
-                    "SINIF SIRA": "",
+                    "İsim": r["Ad Soyad"],
+                    "Sınıf": r["Sınıf"] if pd.notna(r["Sınıf"]) else "",
+                    "AYT TDE-S1 D": r["Türkçe Doğru"], "AYT TDE-S1 Y": r["Türkçe Yanlış"], "AYT TDE-S1 N": r["Türkçe Net"],
+                    "AYT Sosyal-2 D": r["Sosyal Doğru"], "AYT Sosyal-2 Y": r["Sosyal Yanlış"], "AYT Sosyal-2 N": r["Sosyal Net"],
+                    "AYT Matematik D": r["Matematik Doğru"], "AYT Matematik Y": r["Matematik Yanlış"], "AYT Matematik N": r["Matematik Net"],
+                    "AYT Fen D": r["Fen Doğru"], "AYT Fen Y": r["Fen Yanlış"], "AYT Fen N": r["Fen Net"],
+                    "Toplam D": toplam_d, "Toplam Y": toplam_y, "NET": r["Toplam Net"],
+                    "AYT Puan": r["AYT Puan"],
+                    "AYT Sıra": int(r["AYT Sıra"]),
+                    "AYT Okul": int(r["AYT Sıra"]),
+                    "AYT Genel": int(r["AYT Sıra"]),
                 }
             )
 
-    df_tyt = pd.DataFrame(tyt_rows)
+    df_report = pd.DataFrame(report_rows)
+    avg_row = {"Sıra": "", "Numara": "", "İsim": "Genel Ortalama", "Sınıf": ""}
+    numeric_cols = [c for c in df_report.columns if c not in {"Sıra", "Numara", "İsim", "Sınıf"}]
+    for col in numeric_cols:
+        series = pd.to_numeric(df_report[col], errors="coerce")
+        avg_row[col] = round(series.mean(), 3) if series.notna().any() else ""
+    for col in df_report.columns:
+        avg_row.setdefault(col, "")
+    df_report = pd.concat([pd.DataFrame([avg_row]), df_report], ignore_index=True)
 
-    df_net = df_tyt.copy()
-    df_net = df_net.sort_values("NET", ascending=False).reset_index(drop=True)
-    df_net["NO"] = range(1, len(df_net) + 1)
+    df_net = df_report.copy()
+    student_mask = df_net["Sıra"] != ""
+    students = df_net[student_mask].copy().sort_values("NET", ascending=False).reset_index(drop=True)
+    students["Sıra"] = range(1, len(students) + 1)
+    df_net = pd.concat([df_net[~student_mask], students], ignore_index=True)
+
+    kazanim_detail = pd.DataFrame()
+    kazanim_weak = pd.DataFrame()
+    kazanim_summary = pd.DataFrame()
+    if kazanim_path:
+        kz_table = load_kazanim_table(kazanim_path)
+        kazanim_detail, kazanim_weak, kazanim_summary = build_kazanim_analysis(df, keys, kz_table)
 
     with pd.ExcelWriter(output_xlsx, engine="openpyxl") as writer:
-        df_tyt.to_excel(writer, sheet_name="TYT", index=False)
+        df_report.to_excel(writer, sheet_name="TYT", index=False)
         df_net.to_excel(writer, sheet_name="NET SIRALI", index=False)
         df.to_excel(writer, sheet_name="Sonuçlar", index=False)
         df_stats.to_excel(writer, sheet_name="İstatistikler", index=False)
+        if not kazanim_weak.empty:
+            kazanim_weak.to_excel(writer, sheet_name="Kazanım Zayıf", index=False)
+        if not kazanim_summary.empty:
+            kazanim_summary.to_excel(writer, sheet_name="Kazanım Özet", index=False)
+        if not kazanim_detail.empty:
+            kazanim_detail.to_excel(writer, sheet_name="Kazanım Detay", index=False)
 
-        def style_sheet(ws):
-            ws.insert_rows(1, amount=2)
-            if is_tyt_profile:
-                ws["F1"] = "TYT-TÜRKÇE"
-                ws["I1"] = "TYT-SOSYAL BİLİMLER"
-                ws["U1"] = "TYT-MATEMATİK"
-                ws["X1"] = "TYT-FEN BİLİMLERİ"
-
-                ws.merge_cells("F1:H1")
-                ws.merge_cells("I1:T1")
-                ws.merge_cells("U1:W1")
-                ws.merge_cells("X1:AF1")
-
-                ws["F2"] = "TÜRKÇE"
-                ws.merge_cells("F2:H2")
-
-                ws["I2"] = "TARİH"
-                ws.merge_cells("I2:K2")
-                ws["L2"] = "COĞRAFYA"
-                ws.merge_cells("L2:N2")
-                ws["O2"] = "FELSEFE"
-                ws.merge_cells("O2:Q2")
-                ws["R2"] = "DİN KÜLTÜRÜ"
-                ws.merge_cells("R2:T2")
-
-                ws["U2"] = "MATEMATİK"
-                ws.merge_cells("U2:W2")
-
-                ws["X2"] = "FİZİK"
-                ws.merge_cells("X2:Z2")
-                ws["AA2"] = "KİMYA"
-                ws.merge_cells("AA2:AC2")
-                ws["AD2"] = "BİYOLOJİ"
-                ws.merge_cells("AD2:AF2")
-
-                ws["AG2"] = "TOPLAM"
-                ws.merge_cells("AG2:AI2")
-                ws["AJ2"] = "TYT"
-            else:
-                ws["F1"] = "TÜRK DİLİ VE EDEBİYATI"
-                ws["I1"] = "SOSYAL BİLİMLER"
-                ws["L1"] = "MATEMATİK"
-                ws["O1"] = "FEN BİLİMLERİ"
-                ws["R1"] = "TOPLAM"
-
-                ws.merge_cells("F1:H1")
-                ws.merge_cells("I1:K1")
-                ws.merge_cells("L1:N1")
-                ws.merge_cells("O1:Q1")
-                ws.merge_cells("R1:T1")
-
-                ws["F2"] = "TÜRK DİLİ VE EDEBİYATI"
-                ws["I2"] = "SOSYAL BİLİMLER"
-                ws["L2"] = "MATEMATİK"
-                ws["O2"] = "FEN BİLİMLERİ"
-                ws["R2"] = "TOPLAM"
-
-                ws.merge_cells("F2:H2")
-                ws.merge_cells("I2:K2")
-                ws.merge_cells("L2:N2")
-                ws.merge_cells("O2:Q2")
-                ws.merge_cells("R2:T2")
-                ws["U2"] = "PUAN"
-
+        def style_school(ws):
+            ws.insert_rows(1, amount=5)
             max_col = ws.max_column
-            for row in ws.iter_rows(min_row=1, max_row=3, min_col=1, max_col=max_col):
+            ws["A1"] = "OKUL TEST BAZLI NET LİSTESİ"
+            ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max_col)
+            ws["A2"] = "İL"; ws["D2"] = "İLÇE"; ws["G2"] = "OKUL"; ws["P2"] = "SINAV ADI"; ws["AF2"] = "KATILIMLAR"
+            ws.merge_cells("A2:C2"); ws.merge_cells("D2:F2"); ws.merge_cells("G2:O2"); ws.merge_cells("P2:AE2"); ws.merge_cells("AF2:AI2")
+            ws["AF3"] = "Okul"; ws["AG3"] = "İlçe"; ws["AH3"] = "İl"; ws["AI3"] = "Genel"; ws["AF4"] = len(df)
+            ws.merge_cells("A3:C4"); ws.merge_cells("D3:F4"); ws.merge_cells("G3:O4"); ws.merge_cells("P3:AE4")
+            ws["E5"] = "TYT Türkçe"; ws["H5"] = "TYT Sosyal"; ws["K5"] = "TYT Matematik"; ws["N5"] = "TYT Fen"; ws["Q5"] = "Toplam"
+            ws["T5"] = "TYT"; ws["X5"] = "SÖZ"; ws["AB5"] = "SAY"; ws["AF5"] = "EA"
+            ws.merge_cells("E5:G5"); ws.merge_cells("H5:J5"); ws.merge_cells("K5:M5"); ws.merge_cells("N5:P5"); ws.merge_cells("Q5:S5")
+            ws.merge_cells("T5:W5"); ws.merge_cells("X5:AA5"); ws.merge_cells("AB5:AE5"); ws.merge_cells("AF5:AI5")
+            for row in ws.iter_rows(min_row=1, max_row=6, min_col=1, max_col=max_col):
                 for c in row:
                     c.font = Font(bold=True)
                     c.alignment = Alignment(horizontal="center", vertical="center")
-
-            # Basic alignment
-            for row in ws.iter_rows(min_row=4, max_row=ws.max_row, min_col=1, max_col=max_col):
+            for row in ws.iter_rows(min_row=7, max_row=ws.max_row, min_col=1, max_col=max_col):
                 for c in row:
                     c.alignment = Alignment(horizontal="center", vertical="center")
-            ws.column_dimensions["D"].width = 28
-            ws.column_dimensions["B"].width = 10
-            ws.column_dimensions["C"].width = 8
 
-        style_sheet(writer.book["TYT"])
-        style_sheet(writer.book["NET SIRALI"])
+        def style_tyt(ws):
+            ws.insert_rows(1, amount=2)
+            ws["E1"] = "TYT-TÜRKÇE"; ws["H1"] = "TYT-SOSYAL BİLİMLER"; ws["T1"] = "TYT-MATEMATİK"; ws["W1"] = "TYT-FEN BİLİMLERİ"
+            ws["AF1"] = "TOPLAM"; ws["AI1"] = "TYT"
+            ws.merge_cells("E1:G1"); ws.merge_cells("H1:S1"); ws.merge_cells("T1:V1"); ws.merge_cells("W1:AE1"); ws.merge_cells("AF1:AH1"); ws.merge_cells("AI1:AL1")
+            for row in ws.iter_rows(min_row=1, max_row=3, min_col=1, max_col=ws.max_column):
+                for c in row:
+                    c.font = Font(bold=True)
+                    c.alignment = Alignment(horizontal="center", vertical="center")
+            for row in ws.iter_rows(min_row=4, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+                for c in row:
+                    c.alignment = Alignment(horizontal="center", vertical="center")
+
+        def style_ayt(ws):
+            ws.insert_rows(1, amount=2)
+            ws["E1"] = "AYT TDE-S1"; ws["H1"] = "AYT SOSYAL-2"; ws["K1"] = "AYT MATEMATİK"; ws["N1"] = "AYT FEN"; ws["Q1"] = "TOPLAM"; ws["T1"] = "AYT"
+            ws.merge_cells("E1:G1"); ws.merge_cells("H1:J1"); ws.merge_cells("K1:M1"); ws.merge_cells("N1:P1"); ws.merge_cells("Q1:S1"); ws.merge_cells("T1:W1")
+            for row in ws.iter_rows(min_row=1, max_row=3, min_col=1, max_col=ws.max_column):
+                for c in row:
+                    c.font = Font(bold=True)
+                    c.alignment = Alignment(horizontal="center", vertical="center")
+            for row in ws.iter_rows(min_row=4, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+                for c in row:
+                    c.alignment = Alignment(horizontal="center", vertical="center")
+
+        if exam_profile == "school_30x4":
+            style_school(writer.book["TYT"])
+            style_school(writer.book["NET SIRALI"])
+        elif exam_profile == "tyt":
+            style_tyt(writer.book["TYT"])
+            style_tyt(writer.book["NET SIRALI"])
+        else:
+            style_ayt(writer.book["TYT"])
+            style_ayt(writer.book["NET SIRALI"])
 
     print(f"Tamamlandı: {output_xlsx}")
     print("Tahmini kitapçık dağılımı:")
@@ -885,6 +1214,9 @@ def run_pipeline(txt_path, pdf_path, output_xlsx):
     key_json_path = str(output_xlsx).rsplit(".", 1)[0] + "_answer_key.standard.json"
     save_standard_key_json(keys, key_json_path)
     print(f"Standart cevap anahtarı kaydedildi: {key_json_path}")
+    if not kazanim_weak.empty:
+        print(f"Kazanım analizi üretildi: {len(kazanim_weak)} satır zayıf kazanım.")
+        df.attrs["kazanim_weak_preview"] = kazanim_weak.head(20).to_dict("records")
     return df
 
 

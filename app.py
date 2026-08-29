@@ -41,37 +41,38 @@ def _serialize_standard_keys(keys):
 
 
 txt_file = st.file_uploader("Öğrenci dosyası (.txt)", type=["txt"])
-pdf_file = st.file_uploader("Cevap anahtarı (.pdf)", type=["pdf"])
+key_file = st.file_uploader("Cevap anahtarı (.pdf / .json)", type=["pdf", "json"])
 kazanim_file = st.file_uploader(
     "Kazanım tablosu (.csv / .xlsx) - Opsiyonel",
     type=["csv", "xlsx"],
 )
 
 if st.button("Sonuç Oluştur", type="primary", use_container_width=True):
-    if txt_file is None or pdf_file is None:
-        st.error("Lütfen hem TXT hem PDF dosyasını yükleyin.")
+    if txt_file is None or key_file is None:
+        st.error("Lütfen hem TXT hem cevap anahtarı dosyasını yükleyin.")
     else:
         with st.spinner("Dosyalar işleniyor..."):
             with tempfile.TemporaryDirectory() as tmpdir:
                 tmp = Path(tmpdir)
                 txt_path = tmp / txt_file.name
-                pdf_path = tmp / pdf_file.name
+                key_path = tmp / key_file.name
                 key_json_path = tmp / "answer_key.standard.json"
                 out_path = tmp / "sinav_sonuclari.xlsx"
                 kazanim_path = None
 
                 txt_path.write_bytes(txt_file.getvalue())
-                pdf_path.write_bytes(pdf_file.getvalue())
+                key_path.write_bytes(key_file.getvalue())
                 if kazanim_file is not None:
                     kazanim_path = tmp / kazanim_file.name
                     kazanim_path.write_bytes(kazanim_file.getvalue())
 
                 try:
-                    # Auto-generate draft standard key JSON from uploaded PDF.
-                    standard_keys = normalize_keys(parse_pdf_keys(str(pdf_path)))
-                    key_json_path.write_bytes(_serialize_standard_keys(standard_keys))
+                    if key_path.suffix.lower() == ".json":
+                        key_json_path.write_bytes(key_path.read_bytes())
+                    else:
+                        standard_keys = normalize_keys(parse_pdf_keys(str(key_path)))
+                        key_json_path.write_bytes(_serialize_standard_keys(standard_keys))
 
-                    # Run scoring with standardized key, not raw PDF.
                     df = run_pipeline(
                         str(txt_path),
                         str(key_json_path),

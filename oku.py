@@ -66,9 +66,123 @@ def normalize_answers(s):
     return "".join(ch if ch in "ABCDE" else " " for ch in s)
 
 
+def to_ascii_upper(s):
+    n = unicodedata.normalize("NFKD", s)
+    n = "".join(ch for ch in n if not unicodedata.combining(ch))
+    return n.upper()
+
+
+def norm_test_name(line):
+    t = to_ascii_upper(line)
+    if "TURK DILI VE EDEBIYATI" in t or "TURK DILI EDEBIYATI" in t:
+        return "Türkçe"
+    if "TURKCE" in t:
+        return "Türkçe"
+    if "SOSYAL BILIMLER" in t:
+        return "Sosyal"
+    if "SOSYAL" in t:
+        return "Sosyal"
+    if "TEMEL MATEMATIK" in t or "MATEMATIK" in t:
+        return "Matematik"
+    if "FEN BILIMLERI" in t:
+        return "Fen"
+    if "FEN" in t:
+        return "Fen"
+    return None
+
+
+def _subjects_for_tyt_table_row(q_num):
+    if q_num <= 20:
+        return ["Türkçe", "Sosyal", "Matematik", "Fen"]
+    if q_num <= 25:
+        return ["Türkçe", "Sosyal", "Matematik"]
+    return ["Türkçe", "Matematik"]
+
+
+def _parse_side_by_side_table_line(line):
+    tokens = line.split()
+    if not tokens or not tokens[0].isdigit():
+        return None
+
+    q_num = int(tokens[0])
+    if q_num < 1 or q_num > 40:
+        return None
+
+    split_idx = None
+    for idx in range(1, len(tokens)):
+        if tokens[idx] == str(q_num):
+            split_idx = idx
+            break
+    if split_idx is None:
+        return None
+
+    subjects = _subjects_for_tyt_table_row(q_num)
+    parsed = {"A": {}, "B": {}}
+    for booklet, answers in (
+        ("A", tokens[1:split_idx]),
+        ("B", tokens[split_idx + 1 :]),
+    ):
+        for subject, ans in zip(subjects, answers):
+            ans = to_ascii_upper(ans)
+            if ans in "ABCDE":
+                parsed[booklet][(subject, q_num)] = ans
+    return parsed
+
+
+def _detect_side_by_side_table(page_text):
+    up = to_ascii_upper(page_text)
+    if "SORU NO" not in up or "TURKCE" not in up or "MATEMATIK" not in up:
+        return False
+    if not ("A KITAP" in up and "B KITAP" in up):
+        return False
+
+    data_rows = 0
+    for line in page_text.splitlines():
+        parsed = _parse_side_by_side_table_line(line.strip())
+        if parsed and parsed["A"] and parsed["B"]:
+            data_rows += 1
+    return data_rows >= 10
+
+
+def _parse_side_by_side_table_pdf(reader):
+    keys = {"A": {name: {} for name, _ in TESTS}, "B": {name: {} for name, _ in TESTS}}
+    found_rows = 0
+
+    for page in reader.pages:
+        page_text = page.extract_text() or ""
+        if not _detect_side_by_side_table(page_text):
+            continue
+
+        for line in page_text.splitlines():
+            parsed = _parse_side_by_side_table_line(line.strip())
+            if not parsed:
+                continue
+            found_rows += 1
+            for booklet in ["A", "B"]:
+                for (subject, q_num), ans in parsed[booklet].items():
+                    keys[booklet][subject][q_num] = ans
+
+    if found_rows < 10:
+        return None
+
+    final = {"A": {}, "B": {}}
+    for booklet in ["A", "B"]:
+        for test_name, default_len in TESTS:
+            section = keys[booklet][test_name]
+            max_q = max(section.keys()) if section else 0
+            length = max_q if max_q > 0 else default_len
+            final[booklet][test_name] = "".join(section.get(i, " ") for i in range(1, length + 1))
+    return final
+
+
 def parse_pdf_keys(pdf_path):
+    reader = PdfReader(pdf_path)
+    side_by_side_keys = _parse_side_by_side_table_pdf(reader)
+    if side_by_side_keys and key_quality(side_by_side_keys) >= 160:
+        return side_by_side_keys
+
     text = ""
-    for page in PdfReader(pdf_path).pages:
+    for page in reader.pages:
         text += (page.extract_text() or "") + "\n"
 
     keys = {"A": {}, "B": {}}
@@ -82,29 +196,6 @@ def parse_pdf_keys(pdf_path):
         "Matematik": 40,
         "Fen": 40,         # AYT Fen: 40
     }
-
-    def to_ascii_upper(s):
-        n = unicodedata.normalize("NFKD", s)
-        n = "".join(ch for ch in n if not unicodedata.combining(ch))
-        return n.upper()
-
-    def norm_test_name(line):
-        t = to_ascii_upper(line)
-        if "TURK DILI VE EDEBIYATI" in t or "TURK DILI EDEBIYATI" in t:
-            return "Türkçe"
-        if "TURKCE" in t:
-            return "Türkçe"
-        if "SOSYAL BILIMLER" in t:
-            return "Sosyal"
-        if "SOSYAL" in t:
-            return "Sosyal"
-        if "MATEMATIK" in t:
-            return "Matematik"
-        if "FEN BILIMLERI" in t:
-            return "Fen"
-        if "FEN" in t:
-            return "Fen"
-        return None
 
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     first_test_idx = next((i for i, ln in enumerate(lines) if norm_test_name(ln)), -1)
@@ -346,6 +437,8 @@ def detect_exam_profile(lengths):
     if signature == (30, 30, 30, 30):
         return "school_30x4"
     if signature == (40, 20, 40, 20):
+        return "tyt"
+    if signature[0] == 40 and signature[2] == 40 and signature[3] == 20 and 20 <= signature[1] <= 25:
         return "tyt"
     return "ayt_like"
 

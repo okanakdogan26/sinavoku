@@ -18,16 +18,11 @@ TESTS = [
 ]
 DEFAULT_TEST_LENGTHS = dict(TESTS)
 
-TYT_SOCIAL_BREAKDOWN = [
-    ("Tarih", 0, 5),
-    ("Coğrafya", 5, 10),
-    ("Felsefe", 10, 15),
-    ("Din", 15, 20),
-]
-TYT_FEN_BREAKDOWN = [
-    ("Fizik", 0, 7),
-    ("Kimya", 7, 14),
-    ("Biyoloji", 14, 20),
+STANDARD_TYT_FOUR_BLOCK_CANDIDATES = [
+    (55, 105, 155, 205),
+    (55, 100, 155, 205),
+    (55, 105, 150, 200),
+    (55, 95, 150, 200),
 ]
 
 # TYT puanı için kurum çıktısına kalibre edilmiş katsayılar.
@@ -528,9 +523,15 @@ def extract_answers(line, layout, lengths):
     )
 
 
+def _layout_evaluation_lines(lines, sample_size=25):
+    long_lines = [line for line in lines if len(line) >= 180]
+    source = long_lines if long_lines else lines
+    return source[:sample_size]
+
+
 def _evaluate_layout(lines, keys, lengths, layout):
     totals = []
-    for line in lines:
+    for line in _layout_evaluation_lines(lines):
         if layout["mode"] == "two_blocks":
             g1 = lengths["Türkçe"] + lengths["Sosyal"]
             g2 = lengths["Matematik"] + lengths["Fen"]
@@ -557,6 +558,29 @@ def _evaluate_layout(lines, keys, lengths, layout):
     return (sum(totals) / len(totals), min(totals))
 
 
+def _detect_layout_four_blocks_fast(lines, keys, lengths):
+    signature = (
+        lengths["Türkçe"],
+        lengths["Sosyal"],
+        lengths["Matematik"],
+        lengths["Fen"],
+    )
+    if signature != (40, 20, 40, 20):
+        return None
+
+    best_candidate = None
+    for starts in STANDARD_TYT_FOUR_BLOCK_CANDIDATES:
+        layout = {"mode": "four_blocks", "starts": starts}
+        metrics = _evaluate_layout(lines, keys, lengths, layout)
+        if metrics is None:
+            continue
+        mean_total, min_total = metrics
+        cand = (mean_total, min_total, layout)
+        if best_candidate is None or (cand[0], cand[1]) > (best_candidate[0], best_candidate[1]):
+            best_candidate = cand
+    return best_candidate
+
+
 def _detect_layout_two_blocks(lines, keys, lengths):
     lengths = get_test_lengths(keys)
     g1 = lengths["Türkçe"] + lengths["Sosyal"]
@@ -568,8 +592,10 @@ def _detect_layout_two_blocks(lines, keys, lengths):
 
     # Auto detect answer blocks.
     candidates = []
-    for s1 in range(45, max_s1 + 1):
-        for s2 in range(min_s2, max_s2 + 1):
+    s1_step = 2 if max_s1 - 45 > 30 else 1
+    s2_step = 3 if max_s2 - min_s2 > 60 else 1
+    for s1 in range(45, max_s1 + 1, s1_step):
+        for s2 in range(min_s2, max_s2 + 1, s2_step):
             for o1 in [0, 1]:
                 for o2 in [0, 1]:
                     layout = {"mode": "two_blocks", "s1": s1, "s2": s2, "o1": o1, "o2": o2}
@@ -691,8 +717,10 @@ def _detect_layout_four_blocks(lines, keys, lengths):
 
 def detect_layout(lines, keys):
     lengths = get_test_lengths(keys)
+    best_four = _detect_layout_four_blocks_fast(lines, keys, lengths)
+    if best_four is None:
+        best_four = _detect_layout_four_blocks(lines, keys, lengths)
     best_two = _detect_layout_two_blocks(lines, keys, lengths)
-    best_four = _detect_layout_four_blocks(lines, keys, lengths)
 
     if best_two is None and best_four is None:
         raise ValueError("TXT içinde cevap blokları bulunamadı.")
@@ -744,30 +772,34 @@ def d_y_n(ans, key):
     return d, y, n
 
 
-def build_tyt_sub_scores(ans_map, keyset):
-    scores = {}
-    sos_ans = ans_map.get("Sosyal", "")
-    sos_key = keyset.get("Sosyal", "")
-    fen_ans = ans_map.get("Fen", "")
-    fen_key = keyset.get("Fen", "")
-
-    social_slices = list(TYT_SOCIAL_BREAKDOWN)
-    if len(sos_key) > 20:
-        social_slices.append(("Sosyal Ek", 20, len(sos_key)))
-
-    for name, start, end in social_slices:
-        d, y, n = d_y_n(sos_ans[start:end], sos_key[start:end])
-        scores[f"{name} D"] = d
-        scores[f"{name} Y"] = y
-        scores[f"{name} N"] = n
-
-    for name, start, end in TYT_FEN_BREAKDOWN:
-        d, y, n = d_y_n(fen_ans[start:end], fen_key[start:end])
-        scores[f"{name} D"] = d
-        scores[f"{name} Y"] = y
-        scores[f"{name} N"] = n
-
-    return scores
+def build_tyt_report_row(r):
+    toplam_d = r["Türkçe Doğru"] + r["Sosyal Doğru"] + r["Matematik Doğru"] + r["Fen Doğru"]
+    toplam_y = r["Türkçe Yanlış"] + r["Sosyal Yanlış"] + r["Matematik Yanlış"] + r["Fen Yanlış"]
+    return {
+        "Sıra": int(r["Sıra"]),
+        "Numara": 0,
+        "İsim": r["Ad Soyad"],
+        "Sınıf": r["Sınıf"] if pd.notna(r["Sınıf"]) else "",
+        "Türkçe D": r["Türkçe Doğru"],
+        "Türkçe Y": r["Türkçe Yanlış"],
+        "Türkçe N": r["Türkçe Net"],
+        "Sosyal B. D": r["Sosyal Doğru"],
+        "Sosyal B. Y": r["Sosyal Yanlış"],
+        "Sosyal B. N": r["Sosyal Net"],
+        "Matematik D": r["Matematik Doğru"],
+        "Matematik Y": r["Matematik Yanlış"],
+        "Matematik N": r["Matematik Net"],
+        "Fen B. D": r["Fen Doğru"],
+        "Fen B. Y": r["Fen Yanlış"],
+        "Fen B. N": r["Fen Net"],
+        "Toplam D": toplam_d,
+        "Toplam Y": toplam_y,
+        "NET": r["Toplam Net"],
+        "TYT Puan": r["TYT Puan"],
+        "TYT Sıra": int(r["TYT Sıra"]),
+        "TYT Okul": int(r["TYT Sıra"]),
+        "TYT Genel": int(r["TYT Sıra"]),
+    }
 
 
 def compute_tyt_score(row):
@@ -1081,8 +1113,6 @@ def run_pipeline(txt_path, pdf_path, output_xlsx, kazanim_path=None):
                 "Ans Fen": answers["Fen"],
                 **best_score,
             }
-        if detect_exam_profile(lengths) == "tyt":
-            row.update(build_tyt_sub_scores(answers, keys[best_booklet]))
         results.append(row)
 
     df = pd.DataFrame(results)
@@ -1198,33 +1228,7 @@ def run_pipeline(txt_path, pdf_path, output_xlsx, kazanim_path=None):
             )
     elif exam_profile == "tyt":
         for _, r in df.iterrows():
-            bk = r["Tahmini Kitapçık"]
-            key = keys[bk]
-            sub_scores = build_tyt_sub_scores(
-                {
-                    "Sosyal": r["Ans Sosyal"],
-                    "Fen": r["Ans Fen"],
-                },
-                key,
-            )
-            toplam_d = r["Türkçe Doğru"] + r["Sosyal Doğru"] + r["Matematik Doğru"] + r["Fen Doğru"]
-            toplam_y = r["Türkçe Yanlış"] + r["Sosyal Yanlış"] + r["Matematik Yanlış"] + r["Fen Yanlış"]
-            report_rows.append(
-                {
-                    "Sıra": int(r["Sıra"]),
-                    "Numara": 0,
-                    "İsim": r["Ad Soyad"],
-                    "Sınıf": r["Sınıf"] if pd.notna(r["Sınıf"]) else "",
-                    "Türkçe D": r["Türkçe Doğru"], "Türkçe Y": r["Türkçe Yanlış"], "Türkçe N": r["Türkçe Net"],
-                    **sub_scores,
-                    "Matematik D": r["Matematik Doğru"], "Matematik Y": r["Matematik Yanlış"], "Matematik N": r["Matematik Net"],
-                    "Toplam D": toplam_d, "Toplam Y": toplam_y, "NET": r["Toplam Net"],
-                    "TYT Puan": r["TYT Puan"],
-                    "TYT Sıra": int(r["TYT Sıra"]),
-                    "TYT Okul": int(r["TYT Sıra"]),
-                    "TYT Genel": int(r["TYT Sıra"]),
-                }
-            )
+            report_rows.append(build_tyt_report_row(r))
     else:
         for _, r in df.iterrows():
             toplam_d = r["Türkçe Doğru"] + r["Sosyal Doğru"] + r["Matematik Doğru"] + r["Fen Doğru"]
@@ -1305,9 +1309,18 @@ def run_pipeline(txt_path, pdf_path, output_xlsx, kazanim_path=None):
 
         def style_tyt(ws):
             ws.insert_rows(1, amount=2)
-            ws["E1"] = "TYT-TÜRKÇE"; ws["H1"] = "TYT-SOSYAL BİLİMLER"; ws["T1"] = "TYT-MATEMATİK"; ws["W1"] = "TYT-FEN BİLİMLERİ"
-            ws["AF1"] = "TOPLAM"; ws["AI1"] = "TYT"
-            ws.merge_cells("E1:G1"); ws.merge_cells("H1:S1"); ws.merge_cells("T1:V1"); ws.merge_cells("W1:AE1"); ws.merge_cells("AF1:AH1"); ws.merge_cells("AI1:AL1")
+            ws["E1"] = "Türkçe"
+            ws["H1"] = "Sosyal B."
+            ws["K1"] = "Matematik"
+            ws["N1"] = "Fen B."
+            ws["Q1"] = "TOPLAM"
+            ws["T1"] = "TYT"
+            ws.merge_cells("E1:G1")
+            ws.merge_cells("H1:J1")
+            ws.merge_cells("K1:M1")
+            ws.merge_cells("N1:P1")
+            ws.merge_cells("Q1:S1")
+            ws.merge_cells("T1:W1")
             for row in ws.iter_rows(min_row=1, max_row=3, min_col=1, max_col=ws.max_column):
                 for c in row:
                     c.font = Font(bold=True)

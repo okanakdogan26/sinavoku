@@ -18,6 +18,18 @@ TESTS = [
 ]
 DEFAULT_TEST_LENGTHS = dict(TESTS)
 
+TYT_SOCIAL_BREAKDOWN = [
+    ("Tarih", 0, 5),
+    ("Coğrafya", 5, 10),
+    ("Felsefe", 10, 15),
+    ("Din", 15, 20),
+]
+TYT_FEN_BREAKDOWN = [
+    ("Fizik", 0, 7),
+    ("Kimya", 7, 14),
+    ("Biyoloji", 14, 20),
+]
+
 # TYT puanı için kurum çıktısına kalibre edilmiş katsayılar.
 # (11.SINIF SÜREÇ ANALİZİ 1 gerçek sonuç tablosundan türetilmiştir.)
 TYT_BASE_SCORE = 144.9496405
@@ -94,9 +106,26 @@ def norm_test_name(line):
 def _subjects_for_tyt_table_row(q_num):
     if q_num <= 20:
         return ["Türkçe", "Sosyal", "Matematik", "Fen"]
-    if q_num <= 25:
-        return ["Türkçe", "Sosyal", "Matematik"]
     return ["Türkçe", "Matematik"]
+
+
+def _assign_tyt_table_answers(parsed, booklet, q_num, answers):
+    if q_num <= 20:
+        for subject, ans in zip(_subjects_for_tyt_table_row(q_num), answers):
+            ans = to_ascii_upper(ans)
+            if ans in "ABCDE":
+                parsed[booklet][(subject, q_num)] = ans
+        return
+
+    if not answers:
+        return
+
+    tur = to_ascii_upper(answers[0])
+    mat = to_ascii_upper(answers[-1])
+    if tur in "ABCDE":
+        parsed[booklet][("Türkçe", q_num)] = tur
+    if mat in "ABCDE":
+        parsed[booklet][("Matematik", q_num)] = mat
 
 
 def _parse_side_by_side_table_line(line):
@@ -116,16 +145,12 @@ def _parse_side_by_side_table_line(line):
     if split_idx is None:
         return None
 
-    subjects = _subjects_for_tyt_table_row(q_num)
     parsed = {"A": {}, "B": {}}
     for booklet, answers in (
         ("A", tokens[1:split_idx]),
         ("B", tokens[split_idx + 1 :]),
     ):
-        for subject, ans in zip(subjects, answers):
-            ans = to_ascii_upper(ans)
-            if ans in "ABCDE":
-                parsed[booklet][(subject, q_num)] = ans
+        _assign_tyt_table_answers(parsed, booklet, q_num, answers)
     return parsed
 
 
@@ -505,14 +530,12 @@ def extract_answers(line, layout, lengths):
 
 def _evaluate_layout(lines, keys, lengths, layout):
     totals = []
-    valid = True
     for line in lines:
         if layout["mode"] == "two_blocks":
             g1 = lengths["Türkçe"] + lengths["Sosyal"]
             g2 = lengths["Matematik"] + lengths["Fen"]
             if len(line) < max(layout["s1"] + g1, layout["s2"] + g2):
-                valid = False
-                break
+                continue
         else:
             t_start, s_start, m_start, f_start = layout["starts"]
             if len(line) < max(
@@ -521,8 +544,7 @@ def _evaluate_layout(lines, keys, lengths, layout):
                 m_start + lengths["Matematik"],
                 f_start + lengths["Fen"],
             ):
-                valid = False
-                break
+                continue
 
         ans = extract_answers(line, layout, lengths)
         a = score_with_booklet(ans, keys["A"])
@@ -530,7 +552,7 @@ def _evaluate_layout(lines, keys, lengths, layout):
         best = a if a["Toplam Net"] >= b["Toplam Net"] else b
         totals.append(best["Toplam Net"])
 
-    if not valid or not totals:
+    if not totals:
         return None
     return (sum(totals) / len(totals), min(totals))
 
@@ -720,6 +742,32 @@ def score_with_booklet(ans_map, keyset):
 def d_y_n(ans, key):
     d, y, b, n = calculate_score(ans, key)
     return d, y, n
+
+
+def build_tyt_sub_scores(ans_map, keyset):
+    scores = {}
+    sos_ans = ans_map.get("Sosyal", "")
+    sos_key = keyset.get("Sosyal", "")
+    fen_ans = ans_map.get("Fen", "")
+    fen_key = keyset.get("Fen", "")
+
+    social_slices = list(TYT_SOCIAL_BREAKDOWN)
+    if len(sos_key) > 20:
+        social_slices.append(("Sosyal Ek", 20, len(sos_key)))
+
+    for name, start, end in social_slices:
+        d, y, n = d_y_n(sos_ans[start:end], sos_key[start:end])
+        scores[f"{name} D"] = d
+        scores[f"{name} Y"] = y
+        scores[f"{name} N"] = n
+
+    for name, start, end in TYT_FEN_BREAKDOWN:
+        d, y, n = d_y_n(fen_ans[start:end], fen_key[start:end])
+        scores[f"{name} D"] = d
+        scores[f"{name} Y"] = y
+        scores[f"{name} N"] = n
+
+    return scores
 
 
 def compute_tyt_score(row):
@@ -1020,9 +1068,7 @@ def run_pipeline(txt_path, pdf_path, output_xlsx, kazanim_path=None):
 
         best_booklet = "A" if score_a["Toplam Net"] >= score_b["Toplam Net"] else "B"
         best_score = score_a if best_booklet == "A" else score_b
-
-        results.append(
-            {
+        row = {
                 "TC No": tc_no,
                 "Ad Soyad": ad_soyad,
                 "Sınıf": sinif,
@@ -1035,7 +1081,9 @@ def run_pipeline(txt_path, pdf_path, output_xlsx, kazanim_path=None):
                 "Ans Fen": answers["Fen"],
                 **best_score,
             }
-        )
+        if detect_exam_profile(lengths) == "tyt":
+            row.update(build_tyt_sub_scores(answers, keys[best_booklet]))
+        results.append(row)
 
     df = pd.DataFrame(results)
     if df.empty:
@@ -1152,15 +1200,13 @@ def run_pipeline(txt_path, pdf_path, output_xlsx, kazanim_path=None):
         for _, r in df.iterrows():
             bk = r["Tahmini Kitapçık"]
             key = keys[bk]
-            sos = r["Ans Sosyal"]
-            fen = r["Ans Fen"]
-            tar_d, tar_y, tar_n = d_y_n(sos[0:5], key["Sosyal"][0:5])
-            cog_d, cog_y, cog_n = d_y_n(sos[5:10], key["Sosyal"][5:10])
-            fel_d, fel_y, fel_n = d_y_n(sos[10:15], key["Sosyal"][10:15])
-            din_d, din_y, din_n = d_y_n(sos[15:20], key["Sosyal"][15:20])
-            fiz_d, fiz_y, fiz_n = d_y_n(fen[0:7], key["Fen"][0:7])
-            kim_d, kim_y, kim_n = d_y_n(fen[7:14], key["Fen"][7:14])
-            bio_d, bio_y, bio_n = d_y_n(fen[14:20], key["Fen"][14:20])
+            sub_scores = build_tyt_sub_scores(
+                {
+                    "Sosyal": r["Ans Sosyal"],
+                    "Fen": r["Ans Fen"],
+                },
+                key,
+            )
             toplam_d = r["Türkçe Doğru"] + r["Sosyal Doğru"] + r["Matematik Doğru"] + r["Fen Doğru"]
             toplam_y = r["Türkçe Yanlış"] + r["Sosyal Yanlış"] + r["Matematik Yanlış"] + r["Fen Yanlış"]
             report_rows.append(
@@ -1170,14 +1216,8 @@ def run_pipeline(txt_path, pdf_path, output_xlsx, kazanim_path=None):
                     "İsim": r["Ad Soyad"],
                     "Sınıf": r["Sınıf"] if pd.notna(r["Sınıf"]) else "",
                     "Türkçe D": r["Türkçe Doğru"], "Türkçe Y": r["Türkçe Yanlış"], "Türkçe N": r["Türkçe Net"],
-                    "Tarih D": tar_d, "Tarih Y": tar_y, "Tarih N": tar_n,
-                    "Coğrafya D": cog_d, "Coğrafya Y": cog_y, "Coğrafya N": cog_n,
-                    "Felsefe D": fel_d, "Felsefe Y": fel_y, "Felsefe N": fel_n,
-                    "Din D": din_d, "Din Y": din_y, "Din N": din_n,
+                    **sub_scores,
                     "Matematik D": r["Matematik Doğru"], "Matematik Y": r["Matematik Yanlış"], "Matematik N": r["Matematik Net"],
-                    "Fizik D": fiz_d, "Fizik Y": fiz_y, "Fizik N": fiz_n,
-                    "Kimya D": kim_d, "Kimya Y": kim_y, "Kimya N": kim_n,
-                    "Biyoloji D": bio_d, "Biyoloji Y": bio_y, "Biyoloji N": bio_n,
                     "Toplam D": toplam_d, "Toplam Y": toplam_y, "NET": r["Toplam Net"],
                     "TYT Puan": r["TYT Puan"],
                     "TYT Sıra": int(r["TYT Sıra"]),

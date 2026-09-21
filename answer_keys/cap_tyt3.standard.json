@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "exam_type": "TYT",
+  "tests": [
+    {
+      "name": "Türkçe",
+      "length": 40
+    },
+    {
+      "name": "Sosyal",
+      "length": 25
+    },
+    {
+      "name": "Matematik",
+      "length": 40
+    },
+    {
+      "name": "Fen",
+      "length": 20
+    }
+  ],
+  "booklets": {
+    "A": {
+      "Türkçe": "DBDBCDDEABEBCDCCCABDDCEDCBEDCCBDBDCBEBDC",
+      "Sosyal": "BACAECABBDCDDEACABDEACEBB",
+      "Matematik": "DECBBCACDBEEDCACECBCDDDDDCCCDDCAECCBECAD",
+      "Fen": "BCABADBBECCEDADCECCE"
+    },
+    "B": {
+      "Türkçe": "BDBDDCBAEDDCBEACCCDDBECEBCDCDBDBCDCBEBDC",
+      "Sosyal": "ACABEBACDBDCAEDCEDBABBECA",
+      "Matematik": "CEDACBBBDCDEEECACDCBCDDDCCDDDCCEACBCDACE",
+      "Fen": "BACBDABBECDECADCCEEC"
+    }
+  }
+}

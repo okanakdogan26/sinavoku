@@ -23,6 +23,8 @@ STANDARD_TYT_FOUR_BLOCK_CANDIDATES = [
     (55, 100, 155, 205),
     (55, 105, 150, 200),
     (55, 95, 150, 200),
+    (51, 97, 143, 189),  # Barış / bazı Optik formları
+    (56, 96, 142, 182),  # Yayın Denizi / bitişik Sosyal blok
 ]
 
 # TYT puanı için kurum çıktısına kalibre edilmiş katsayılar.
@@ -195,162 +197,144 @@ def _parse_side_by_side_table_pdf(reader):
     return final
 
 
-def parse_pdf_keys(pdf_path):
-    reader = PdfReader(pdf_path)
-    side_by_side_keys = _parse_side_by_side_table_pdf(reader)
-    if side_by_side_keys and key_quality(side_by_side_keys) >= 160:
-        return side_by_side_keys
+def _answers_from_columnar_repeated_q_line(line):
+    """Barış vb.: '1. E 1. A 1. C 1. B' — aynı soru no, ders sütunları."""
+    pairs = re.findall(r"(\d+)\.\s*([ABCDE])", line, flags=re.IGNORECASE)
+    if len(pairs) < 2:
+        return None
 
-    text = ""
-    for page in reader.pages:
-        text += (page.extract_text() or "") + "\n"
+    q_nums = [int(q) for q, _ in pairs]
+    if len(set(q_nums)) != 1:
+        return None
 
-    keys = {"A": {}, "B": {}}
-    booklet = None
-    current_test = None
-    # Sequence-style PDF'lerde soru numarası olmadan harf akışı geliyor.
-    # Bu durumda üst sınırlar TYT/AYT ortak kapsayacak şekilde geniş tutulur.
-    test_counts = {
-        "Türkçe": 40,
-        "Sosyal": 46,      # AYT Sosyal-2: 46
-        "Matematik": 40,
-        "Fen": 40,         # AYT Fen: 40
-    }
+    q_num = q_nums[0]
+    if q_num < 1 or q_num > 40:
+        return None
 
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    first_test_idx = next((i for i, ln in enumerate(lines) if norm_test_name(ln)), -1)
-    a_header_idx = next((i for i, ln in enumerate(lines) if "A KITAP" in to_ascii_upper(ln) or re.search(r"\(A\)", to_ascii_upper(ln))), -1)
-    b_header_idx = next((i for i, ln in enumerate(lines) if "B KITAP" in to_ascii_upper(ln) or re.search(r"\(B\)", to_ascii_upper(ln))), -1)
-    alternating_mode = (
-        first_test_idx != -1
-        and a_header_idx != -1
-        and b_header_idx != -1
-        and a_header_idx < first_test_idx
-        and b_header_idx < first_test_idx
-    )
-    section_occurrence = {name: 0 for name, _ in TESTS}
+    answers = [ans.upper() for _, ans in pairs]
+    bucket = {"X": {}}
+    _assign_tyt_table_answers(bucket, "X", q_num, answers)
+    return q_num, bucket["X"]
 
-    def add_by_sequence(booklet_name, test_name, letters):
-        d = keys[booklet_name].setdefault(test_name, {})
-        limit = test_counts[test_name]
-        next_q = len(d) + 1
-        for ch in letters:
-            if next_q > limit:
-                break
-            d[next_q] = ch
-            next_q += 1
 
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line:
-            continue
+def _detect_booklet_on_page(page_text):
+    up = to_ascii_upper(page_text)
+    if re.search(r"\bA\s*KITAPC", up) or re.search(r"SINAVI\s*-\s*\d+\s*A\b", up):
+        return "A"
+    if re.search(r"\bB\s*KITAPC", up) or re.search(r"SINAVI\s*-\s*\d+\s*B\b", up):
+        return "B"
 
-        up = to_ascii_upper(line)
-        if not alternating_mode and ("A KITAP" in up or re.search(r"\(A\)", up)):
-            booklet = "A"
-            current_test = None
-            continue
-        if not alternating_mode and ("B KITAP" in up or re.search(r"\(B\)", up)):
-            booklet = "B"
-            current_test = None
-            continue
-        if alternating_mode and ("A KITAP" in up or "B KITAP" in up or re.search(r"\([AB]\)", up)):
-            continue
-        if not alternating_mode and booklet is None:
-            continue
+    lines = [ln.strip() for ln in page_text.splitlines() if ln.strip()]
+    for ln in reversed(lines[-8:]):
+        up_ln = to_ascii_upper(ln)
+        if up_ln in ("A", "B"):
+            return up_ln
+        if re.fullmatch(r"[AB]\s*KITAPCIGI", up_ln):
+            return up_ln[0]
+        m = re.search(r"\b([AB])$", up_ln)
+        if m and ("SINAV" in up_ln or "DENEME" in up_ln or "KITAP" in up_ln):
+            return m.group(1)
+    return None
 
-        test_name = norm_test_name(line)
-        if test_name:
-            current_test = test_name
-            if alternating_mode:
-                idx = section_occurrence[test_name]
-                booklet = "A" if idx % 2 == 0 else "B"
-                section_occurrence[test_name] += 1
-            continue
 
-        if current_test is None:
-            continue
+def _detect_columnar_booklet_page(page_text):
+    rows = 0
+    for line in page_text.splitlines():
+        if _answers_from_columnar_repeated_q_line(line.strip()):
+            rows += 1
+    if rows < 10:
+        return False
+    up = to_ascii_upper(page_text)
+    return ("TURKCE" in up and "MATEMATIK" in up) or ("SOSYAL" in up and "FEN" in up)
 
-        # Format 1: "1. A 2. B ..."
-        for q, ans in re.findall(r"(\d+)\.\s*([ABCDE])", line):
-            keys[booklet].setdefault(current_test, {})[int(q)] = ans
 
-        # Format 2 fallback: separate answer lines like "A D E C ..."
-        if not re.search(r"\d", line):
-            letters = re.findall(r"[ABCDE]", up)
-            if letters:
-                add_by_sequence(booklet, current_test, letters)
-
-    # Format 3 fallback: chunk by booklet/test headings and stream letters.
-    # This catches PDFs where numbering is broken or punctuation lost.
-    if key_quality(keys) < 160:
-        keys2 = {"A": {}, "B": {}}
-        booklet2 = None
-        test2 = None
-        for line in lines:
-            up = to_ascii_upper(line)
-            if "A KITAP" in up or re.search(r"\(A\)", up):
-                booklet2 = "A"
-                test2 = None
-                continue
-            if "B KITAP" in up or re.search(r"\(B\)", up):
-                booklet2 = "B"
-                test2 = None
-                continue
-            if booklet2 is None:
-                continue
-
-            ntest = norm_test_name(line)
-            if ntest:
-                test2 = ntest
-                continue
-            if test2 is None:
-                continue
-
-            letters = re.findall(r"[ABCDE]", up)
-            if letters:
-                d = keys2[booklet2].setdefault(test2, {})
-                limit = test_counts[test2]
-                next_q = len(d) + 1
-                for ch in letters:
-                    if next_q > limit:
-                        break
-                    d[next_q] = ch
-                    next_q += 1
-
-        # Pick better parse by filled-answer quality.
-        def to_final(kdict):
-            out = {"A": {}, "B": {}}
-            for b in ["A", "B"]:
-                for test_name, default_len in TESTS:
-                    d = kdict[b].get(test_name, {})
-                    max_q = max(d.keys()) if d else 0
-                    length = max_q if max_q > 0 else default_len
-                    out[b][test_name] = "".join(d.get(i, " ") for i in range(1, length + 1))
-            return out
-
-        final1 = {"A": {}, "B": {}}
-        for b in ["A", "B"]:
-            for test_name, default_len in TESTS:
-                d = keys[b].get(test_name, {})
-                max_q = max(d.keys()) if d else 0
-                length = max_q if max_q > 0 else default_len
-                final1[b][test_name] = "".join(d.get(i, " ") for i in range(1, length + 1))
-        final2 = to_final(keys2)
-
-        if key_quality(final2) > key_quality(final1):
-            return final2
-
-    final_keys = {"A": {}, "B": {}}
+def _finalize_booklet_keys(keys):
+    final = {"A": {}, "B": {}}
     for booklet in ["A", "B"]:
         for test_name, default_len in TESTS:
-            d = keys[booklet].get(test_name, {})
-            max_q = max(d.keys()) if d else 0
+            section = keys[booklet][test_name]
+            max_q = max(section.keys()) if section else 0
             length = max_q if max_q > 0 else default_len
-            key = "".join(d.get(i, " ") for i in range(1, length + 1))
-            final_keys[booklet][test_name] = key
+            final[booklet][test_name] = "".join(section.get(i, " ") for i in range(1, length + 1))
+    return final
 
-    return final_keys
+
+def _parse_columnar_booklet_pdf(reader):
+    """Sayfa başı kitapçık; satırlar '1. E 1. A 1. C 1. B' (Barış Yayınları vb.)."""
+    keys = {"A": {name: {} for name, _ in TESTS}, "B": {name: {} for name, _ in TESTS}}
+    pages_used = 0
+    used_booklets = set()
+
+    for page in reader.pages:
+        page_text = page.extract_text() or ""
+        if not _detect_columnar_booklet_page(page_text):
+            continue
+
+        booklet = _detect_booklet_on_page(page_text)
+        if booklet is None:
+            booklet = "A" if "A" not in used_booklets else ("B" if "B" not in used_booklets else None)
+        if booklet is None:
+            continue
+
+        page_rows = 0
+        for line in page_text.splitlines():
+            parsed = _answers_from_columnar_repeated_q_line(line.strip())
+            if not parsed:
+                continue
+            _, subject_map = parsed
+            page_rows += 1
+            for (subject, q), ans in subject_map.items():
+                if q <= DEFAULT_TEST_LENGTHS.get(subject, 40):
+                    keys[booklet][subject][q] = ans
+
+        if page_rows >= 10:
+            pages_used += 1
+            used_booklets.add(booklet)
+
+    if pages_used < 1:
+        return None
+
+    final = _finalize_booklet_keys(keys)
+    if key_quality(final) < 80:
+        return None
+    return final
+
+
+def parse_pdf_keys(pdf_path):
+    """Çok stratejili evrensel cevap anahtarı okuyucu (PDF/Excel/görüntü/JSON)."""
+    from key_extract import parse_answer_key
+
+    keys, _meta = parse_answer_key(pdf_path)
+    return keys
+
+
+def parse_pdf_keys_detailed(pdf_path):
+    """(keys, meta) — meta: strategy, quality, text_source, candidates."""
+    from key_extract import parse_answer_key
+
+    return parse_answer_key(pdf_path)
+
+
+def _clamp_tyt_sosyal_length(keys):
+    """Yayın Denizi vb. anahtarlarda Sosyal 25 (Felsefe seçmeli) gelir;
+    optik form ve resmi TYT neti 20 sorudur — fazla 5'i kırp."""
+    lengths = {
+        name: max(len(keys.get("A", {}).get(name, "")), len(keys.get("B", {}).get(name, "")))
+        for name, _ in TESTS
+    }
+    if not (
+        lengths.get("Türkçe") == 40
+        and lengths.get("Matematik") == 40
+        and lengths.get("Fen") == 20
+        and 21 <= lengths.get("Sosyal", 0) <= 25
+    ):
+        return keys
+    out = {"A": dict(keys.get("A", {})), "B": dict(keys.get("B", {}))}
+    for booklet in ("A", "B"):
+        sos = out[booklet].get("Sosyal", "")
+        if len(sos) > 20:
+            out[booklet]["Sosyal"] = sos[:20]
+    return out
 
 
 def normalize_keys(keys):
@@ -368,7 +352,7 @@ def normalize_keys(keys):
             s = normalize_answers(s)
             s = (s + (" " * length))[:length]
             out[booklet][test_name] = s
-    return out
+    return _clamp_tyt_sosyal_length(out)
 
 
 def save_standard_key_json(keys, path):
@@ -433,7 +417,11 @@ def calculate_score(student_ans, key_str):
 
 def get_test_lengths(keys):
     def observed_len(s):
-        return len(s) if any(ch in "ABCDE" for ch in s) else 0
+        last = 0
+        for i, ch in enumerate(s, start=1):
+            if ch in "ABCDE":
+                last = i
+        return last
 
     return {
         test_name: (
@@ -644,7 +632,8 @@ def _detect_layout_four_blocks(lines, keys, lengths):
             scores[s] = prefix[s + l] - prefix[s]
         window_scores.append(scores)
 
-    gap = 2
+    # Yayın Denizi vb. formlarda Türkçe hemen ardından Sosyal gelir (gap=0).
+    gap = 0
     l1, l2, l3, l4 = test_lens
     s1_range = range(min_start, max_line_len - (l1 + l2 + l3 + l4 + 3 * gap) + 1)
 
@@ -718,9 +707,18 @@ def _detect_layout_four_blocks(lines, keys, lengths):
 def detect_layout(lines, keys):
     lengths = get_test_lengths(keys)
     best_four = _detect_layout_four_blocks_fast(lines, keys, lengths)
-    if best_four is None:
-        best_four = _detect_layout_four_blocks(lines, keys, lengths)
     best_two = _detect_layout_two_blocks(lines, keys, lengths)
+
+    # Hızlı 4-blok adayı zayıfsa / yoksa tam arama yap (Barış vb. kaymış ofsetler).
+    need_full_four = best_four is None or (
+        best_two is not None and (best_four[0], best_four[1]) <= (best_two[0], best_two[1])
+    )
+    if need_full_four:
+        full_four = _detect_layout_four_blocks(lines, keys, lengths)
+        if full_four is not None and (
+            best_four is None or (full_four[0], full_four[1]) > (best_four[0], best_four[1])
+        ):
+            best_four = full_four
 
     if best_two is None and best_four is None:
         raise ValueError("TXT içinde cevap blokları bulunamadı.")
@@ -732,23 +730,38 @@ def detect_layout(lines, keys):
 
 
 def parse_student_line(line, layout, lengths):
-    prefix = line[:55]
+    if layout["mode"] == "four_blocks":
+        ans_start = layout["starts"][0]
+    else:
+        ans_start = layout["s1"]
+    prefix = line[: max(55, ans_start)]
     ans = extract_answers(line, layout, lengths)
 
     tc_match = re.search(r"\b\d{11}\b", prefix)
     tc_no = tc_match.group(0) if tc_match else ""
 
     if tc_no:
-        name_part = prefix[:tc_match.start()]
-        class_part = prefix[tc_match.end():]
+        before = prefix[: tc_match.start()]
+        after = prefix[tc_match.end() : ans_start]
     else:
-        name_part = prefix
-        class_part = ""
+        before = prefix[:ans_start]
+        after = ""
 
-    # Remove symbols used in first columns.
-    ad_soyad = re.sub(r"[*0-9]", " ", name_part)
-    ad_soyad = re.sub(r"\s+", " ", ad_soyad).strip()
-    sinif = class_part.strip()
+    def clean_name(s):
+        s = re.sub(r"[*0-9]", " ", s)
+        return re.sub(r"\s+", " ", s).strip()
+
+    ad_soyad = clean_name(before)
+    sinif = after.strip()
+    if not ad_soyad and after:
+        # GİS / Tözok: TC no ismin önünde
+        m = re.match(r"\s*([^\d]+?)\s+(\d\S*)?\s*$", after)
+        if m and re.search(r"[A-Za-zÇĞİÖŞÜçğıöşü]", m.group(1) or ""):
+            ad_soyad = re.sub(r"\s+", " ", m.group(1)).strip()
+            sinif = (m.group(2) or "").strip()
+        else:
+            ad_soyad = clean_name(after)
+            sinif = ""
 
     return tc_no, ad_soyad, sinif, ans
 
@@ -1055,8 +1068,8 @@ def run_pipeline(txt_path, pdf_path, output_xlsx, kazanim_path=None):
     }
     if max(per_booklet_quality.values()) < 80:
         raise ValueError(
-            "PDF cevap anahtarı yeterli doğrulukta okunamadı. "
-            "Muhtemelen farklı başlık/yerleşim var; lütfen kontrol edin."
+            "Cevap anahtarı yeterli doğrulukta okunamadı. "
+            "PDF, Excel veya görüntü formatını kontrol edin; gerekirse Anahtar Düzenleyici kullanın."
         )
     for booklet in ["A", "B"]:
         lens = {k: len(v) for k, v in keys[booklet].items()}

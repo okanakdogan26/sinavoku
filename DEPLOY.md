@@ -17,20 +17,31 @@ Tarayıcı: `http://localhost:8501`
 3. Ayarlar:
    - Repository: `<kendi-repon>`
    - Branch: `main` (veya aktif branch)
-   - Main file path: `sinavoku/app.py`
+   - Main file path: `app.py`
 4. Deploy et.
 
-## Uygulama Akışı
+## Desteklenen cevap anahtarı dosyaları
 
-1. `Anahtar Düzenleyici` sekmesinde PDF'den taslak anahtar çıkar.
-2. Gerekirse A/B kitapçık ve ders cevaplarını düzelt.
-3. `Standart JSON İndir` ile `answer_key.standard.json` kaydet.
-4. `Sonuç Üret` sekmesinde:
-   - TXT yükle
-   - Anahtar olarak PDF veya tercihen standart JSON yükle
-   - Excel sonucu indir.
+- **PDF** (metinli): Barış sütunlu, Yayın Denizi / Maarif başlıklı, yan yana A|B tablo
+- **Excel** (`.xlsx`): Tözok satır tablosu, GİS ızgara / çapraz sayfa
+- **JSON**: standart `answer_key.standard.json`
+- **Görüntü** (`.jpg` / `.png`): OCR dener; WhatsApp ekran görüntüsü ve taranmış tablo çoğu zaman zayıf kalır — **Anahtar Düzenleyici** veya hazır JSON kullanın
+
+Öğrenci dosyası: optik form **TXT** (windows-1254).
+
+`samples/` altındaki örnek çiftler bu formatları temsil eder.
 
 ## Notlar
 
-- Her yayınevinin PDF formatı farklı olabilir; bu yüzden standart JSON kullanımı önerilir.
+- Sistem PDF anahtarını birden fazla yerleşim stratejisiyle okur; gerekirse OCR (`pdftoppm` + `tesseract`) dener.
+- Okuma zayıfsa **Anahtar Düzenleyici** sekmesinden düzeltip standart JSON indirin; sonuç üretiminde JSON tercih edin.
 - Üretilen `xlsx` ve `*_answer_key.standard.json` dosyaları `.gitignore` ile versiyon kontrolü dışında tutulur.
+
+### OCR (görüntü / taranmış PDF)
+
+```bash
+# macOS
+brew install poppler tesseract tesseract-lang
+```
+
+Kurulu değilse görüntü PDF’lerde otomatik okuma zayıf kalır; düzenleyici + JSON kullanın.

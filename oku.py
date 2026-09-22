@@ -1,6 +1,8 @@
 import re
 import json
 import unicodedata
+from pathlib import Path
+
 import pandas as pd
 from pypdf import PdfReader
 from openpyxl.styles import Alignment, Font
@@ -1077,8 +1079,21 @@ def run_pipeline(txt_path, pdf_path, output_xlsx, kazanim_path=None):
 
     print("Öğrenci yanıtları okunuyor...")
     results = []
-    with open(txt_path, "r", encoding="windows-1254", errors="replace") as f:
-        lines = [line.rstrip("\n") for line in f if line.strip()]
+    raw_bytes = Path(txt_path).read_bytes()
+    lines = None
+    for enc in ("windows-1254", "utf-8", "utf-8-sig", "latin-1"):
+        try:
+            text = raw_bytes.decode(enc)
+            # cp1254 bazen "başarılı" decode eder ama bozuk üretir; utf-8 BOM/geçerliyse tercih et
+            if enc.startswith("utf-8") or "�" not in text:
+                lines = [line.rstrip("\n") for line in text.splitlines() if line.strip()]
+                if lines:
+                    break
+        except UnicodeDecodeError:
+            continue
+    if not lines:
+        text = raw_bytes.decode("windows-1254", errors="replace")
+        lines = [line.rstrip("\n") for line in text.splitlines() if line.strip()]
 
     lengths = get_test_lengths(keys)
     layout = detect_layout(lines, keys)

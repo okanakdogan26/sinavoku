@@ -5,7 +5,8 @@ Birden fazla PDF/OCR stratejisini dener; en yüksek doluluk skorunu seçer.
 Desteklenen başlıca yerleşimler:
 - A|B yan yana tablo (SORU NO + ders sütunları)
 - Sayfa başı kitapçık, satırda tekrarlı soru no (Barış vb.)
-- Bölüm başlıklı harf/numara akışı (Acil vb.)
+- Bölüm başlıklı harf/numara akışı (Acil / Yayın Denizi vb.)
+- Özde TYT İlk Prova: '1 - C 11 - D …' 4×10 tire ızgarası (A+B)
 - Izgara: 1.A 2.B ... (görüntü/OCR dahil, A|B yan yana satırlar)
 """
 
@@ -254,6 +255,22 @@ def detect_booklet_marker(text: str):
 
 
 def extract_native_page_texts(pdf_path: str):
+    # Özde vb. ızgaralarda pdftotext -layout daha düzenli satır üretir.
+    if shutil.which("pdftotext"):
+        try:
+            proc = subprocess.run(
+                ["pdftotext", "-layout", "-enc", "UTF-8", pdf_path, "-"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            layout_text = proc.stdout or ""
+            if layout_text.count("-") >= 40 and len(layout_text.strip()) > 200:
+                # Sayfa sonu form feed ile böl
+                pages = [p for p in re.split(r"\f+", layout_text) if p.strip()]
+                return pages or [layout_text]
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            pass
     reader = PdfReader(pdf_path)
     return [(page.extract_text() or "") for page in reader.pages]
 
@@ -1207,6 +1224,67 @@ def parse_glued_ocr_grid(text: str, ocr: bool = False):
     return final if key_quality(final) >= 60 else None
 
 
+def parse_ozde_tyt_dash_blocks(text: str, ocr: bool = False):
+    """Özde / TYT İlk Prova: '1 - C 11 - D … 1 - A 11 - C' 4×10 satır blokları.
+
+    Blok sırası (A sonra B, pdftotext -layout ile doğrulanmış):
+      0: A Türkçe(40) + Sosyal(≤25)
+      1: A Matematik(40) + Fen(20)
+      2: B Türkçe + Sosyal
+      3: B Matematik + Fen
+    """
+    dash_re = re.compile(
+        r"(?<!\d)(\d{1,2})\s*[-–—=]\s*([A-Ea-eİıI0O8€£§Þß])",
+    )
+    rows = []
+    for raw in text.splitlines():
+        pairs = []
+        for m in dash_re.finditer(raw):
+            q = int(m.group(1))
+            ans = normalize_ocr_answer(m.group(2))
+            if not ans and m.group(2).upper() in "ABCDE":
+                ans = m.group(2).upper()
+            if ans and 1 <= q <= 40:
+                pairs.append((q, ans))
+        if len(pairs) >= 4:
+            rows.append(pairs)
+
+    if len(rows) < 40:
+        return None
+    rows = rows[:40]
+
+    def accumulate(row_slice):
+        left, right = {}, {}
+        for pairs in row_slice:
+            split_at = None
+            for i in range(1, len(pairs)):
+                if pairs[i][0] < pairs[i - 1][0]:
+                    split_at = i
+                    break
+            left_pairs = pairs if split_at is None else pairs[:split_at]
+            right_pairs = [] if split_at is None else pairs[split_at:]
+            for q, ans in left_pairs:
+                left[q] = ans
+            for q, ans in right_pairs:
+                right[q] = ans
+        return left, right
+
+    # pdftotext -layout: önce A kitapçık (Türkçe/Sosyal + Mat/Fen), sonra B.
+    # pypdf etiketleri sonda karıştırsa da 40 satırlık gövde aynı sırada gelir.
+    keys = empty_dict_keys()
+    for bi, booklet in enumerate(("A", "B")):
+        base = bi * 20
+        tur, sos = accumulate(rows[base : base + 10])
+        mat, fen = accumulate(rows[base + 10 : base + 20])
+        keys[booklet]["Türkçe"] = {q: a for q, a in tur.items() if q <= 40}
+        keys[booklet]["Sosyal"] = {q: a for q, a in sos.items() if q <= 25}
+        keys[booklet]["Matematik"] = {q: a for q, a in mat.items() if q <= 40}
+        keys[booklet]["Fen"] = {q: a for q, a in fen.items() if q <= 20}
+
+    final = finalize_keys(keys)
+    return final if key_quality(final) >= 160 else None
+
+
 def parse_dash_number_grid(text: str, ocr: bool = False):
     """MSÜ: '2- E  9- D  16- C' sütun-major ızgara."""
     dash_re = re.compile(
@@ -1334,6 +1412,7 @@ def collect_text_candidates(page_texts, ocr: bool = False, prefix: str = ""):
     full_text = "\n".join(page_texts)
     pfx = f"{prefix}_" if prefix else ""
     strategies = [
+        (f"{pfx}ozde_tyt_dash_blocks", lambda: parse_ozde_tyt_dash_blocks(full_text, ocr=ocr)),
         (f"{pfx}side_by_side_table", lambda: parse_side_by_side_table(page_texts)),
         (f"{pfx}columnar_booklet", lambda: parse_columnar_booklet(page_texts)),
         (f"{pfx}heading_sequence", lambda: parse_heading_sequence(full_text)),

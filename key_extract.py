@@ -598,6 +598,8 @@ def parse_section_numbered_pairs(text: str, ocr: bool = False):
     booklet = None
     current_test = None
     filled = 0
+    # Barış Maarif vb.: pypdf kitapçık etiketlerini sona atar; tekrar eden ders başlığı B'yi başlatır.
+    repeated_heading = False
 
     for raw in text.splitlines():
         line = raw.strip()
@@ -611,11 +613,13 @@ def parse_section_numbered_pairs(text: str, ocr: bool = False):
                 continue
             booklet = b
             current_test = None
+            repeated_heading = False
             continue
 
         tname = norm_test_name(line)
         if tname and len(find_q_ans_pairs(line, ocr=ocr)) < 3:
             current_test = tname
+            repeated_heading = booklet == "A" and bool(keys["A"][tname])
             continue
 
         pairs = find_q_ans_pairs(line, ocr=ocr)
@@ -625,6 +629,10 @@ def parse_section_numbered_pairs(text: str, ocr: bool = False):
             booklet = "A"
         if current_test is None:
             continue
+        if repeated_heading:
+            repeated_heading = False
+            if pairs[0][0] in keys["A"][current_test] and not keys["B"][current_test]:
+                booklet = "B"
 
         limit = WIDE_TEST_COUNTS[current_test]
         for q, ans in pairs:
